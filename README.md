@@ -1,7 +1,7 @@
 # Portfolio
 Created to store data science codes
 
-credit-risk-modelling-process/
+credit-risk-modelling/
 │
 ├── terraform/                  # INFRASTRUCTURE & SECURITY
 │   ├── secrets.tf              # GCP Secret Manager integration
