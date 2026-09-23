@@ -1,1 +1,169 @@
-#
+name: "dbt Data Quality & CI Gates"
+
+on:
+  pull_request:
+    branches:
+      - main
+    paths:
+      - 'dbt_project/**'
+  push:
+    branches:
+      - main
+    paths:
+      - 'dbt_project/**'
+
+env:
+  DBT_PROJECT_DIR: 'dbt_project'
+  PYTHON_VERSION: '3.11'
+  GCP_WORKLOAD_IDENTITY_PROVIDER: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+  GCP_SERVICE_ACCOUNT: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+  GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+
+permissions:
+  id-token: write      # Required for GCP Workload Identity Federation (OIDC)
+  contents: read       # Required to checkout code
+  pull-requests: write # Required to post dbt compilation/test status in PR comments
+
+jobs:
+  dbt-ci:
+    name: 'dbt Parse, Compile & Test (PR Sandbox)'
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    defaults:
+      run:
+        working-directory: ${{ env.DBT_PROJECT_DIR }}
+
+    steps:
+      - name: 'Checkout Repository'
+        uses: actions/checkout@v4
+
+      - name: 'Set up Python'
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+
+      - name: 'Authenticate to Google Cloud (OIDC)'
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ env.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ env.GCP_SERVICE_ACCOUNT }}
+
+      - name: 'Install dbt and Dependencies'
+        run: |
+          python -m pip install --upgrade pip
+          pip install dbt-bigquery==1.8.0
+
+      - name: 'Install dbt Package Dependencies'
+        run: dbt deps
+
+      - name: 'Configure Temporary dbt Profile'
+        # Dynamically injects profile config using OIDC implicit auth to prevent committing credentials
+        run: |
+          mkdir -p ~/.dbt
+          cat <<EOF > ~/.dbt/profiles.yml
+          data_dbt:
+            target: ci
+            outputs:
+              ci:
+                type: bigquery
+                method: oauth
+                project: ${{ env.GCP_PROJECT_ID }}
+                dataset: dbt_ci_pr_${{ github.event.number }} # Isolated schema per Pull Request
+                threads: 4
+                timeout_seconds: 300
+                location: US
+          EOF
+
+      - name: 'dbt Debug (Verify Connection)'
+        run: dbt debug
+
+      - name: 'dbt Compile (Syntax & Relation Validation)'
+        id: compile
+        run: dbt compile
+
+      - name: 'dbt Run & Test (Isolated PR Schema)'
+        id: run_and_test
+        # Builds models in the temporary PR schema (dbt_ci_pr_123) and executes data quality assertions
+        run: |
+          dbt build --target ci
+
+      - name: 'Post dbt Test Results to PR'
+        uses: actions/github-script@v7
+        if: always() && github.event_name == 'pull_request'
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const compileOutcome = '${{ steps.compile.outcome }}';
+            const runOutcome = '${{ steps.run_and_test.outcome }}';
+            const prNumber = context.issue.number;
+
+            const body = `### dbt Data Quality & CI Results 🧪
+            * **Schema Target:** \`dbt_ci_pr_${prNumber}\`
+            * **Compilation:** \`${compileOutcome === 'success' ? '✅ Passed' : '❌ Failed'}\`
+            * **Build & Data Tests:** \`${runOutcome === 'success' ? '✅ Passed' : '❌ Failed'}\`
+
+            *All models built during this check are isolated in the PR schema and will not pollute production tables.*`;
+
+            github.rest.issues.createComment({
+              issue_number: prNumber,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: body
+            });
+
+      - name: 'Fail CI if dbt Run or Test Failed'
+        if: steps.run_and_test.outcome == 'failure' || steps.compile.outcome == 'failure'
+        run: exit 1
+
+  dbt-prod-deploy:
+    name: 'dbt Production Manifest Build'
+    runs-on: ubuntu-latest
+    needs: dbt-ci
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    defaults:
+      run:
+        working-directory: ${{ env.DBT_PROJECT_DIR }}
+
+    steps:
+      - name: 'Checkout Repository'
+        uses: actions/checkout@v4
+
+      - name: 'Set up Python'
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: 'Authenticate to Google Cloud (OIDC)'
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ env.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ env.GCP_SERVICE_ACCOUNT }}
+
+      - name: 'Install dbt'
+        run: |
+          python -m pip install --upgrade pip
+          pip install dbt-bigquery==1.8.0
+
+      - name: 'Configure Production dbt Profile'
+        run: |
+          mkdir -p ~/.dbt
+          cat <<EOF > ~/.dbt/profiles.yml
+          data_dbt:
+            target: prod
+            outputs:
+              prod:
+                type: bigquery
+                method: oauth
+                project: ${{ env.GCP_PROJECT_ID }}
+                dataset: data_warehouse
+                threads: 8
+                timeout_seconds: 600
+                location: US
+          EOF
+
+      - name: 'Build dbt Documentation & Production Manifest'
+        run: |
+          dbt deps
+          dbt compile --target prod
+          dbt docs generate --target prod
